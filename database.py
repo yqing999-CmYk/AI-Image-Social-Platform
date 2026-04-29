@@ -1,13 +1,18 @@
+import os
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 from app.config import get_settings
 
 settings = get_settings()
 
+# Vercel serverless: skip connection pooling to prevent connection exhaustion
+_pool_kwargs = {"poolclass": NullPool} if os.getenv("VERCEL") else {"pool_pre_ping": True}
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    pool_pre_ping=True,
+    **_pool_kwargs,
 )
 
 AsyncSessionLocal = async_sessionmaker(
