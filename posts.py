@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update
@@ -6,8 +7,9 @@ from app.database import get_db
 from app.models.topic import Topic
 from app.models.post import Post, PostLike, VoteType
 from app.models.user import User
+from app.models.follow import Follow
 from app.schemas.post import PostCreate, PostPublic, PostList, VoteRequest
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_optional_current_user
 
 router = APIRouter(prefix="/topics/{topic_id}/posts", tags=["posts"])
 
@@ -17,12 +19,27 @@ def _post_query():
     return select(Post).options(selectinload(Post.author), selectinload(Post.image))
 
 
+async def _followed_ids(db: AsyncSession, user: Optional[User]) -> set[int]:
+    if not user:
+        return set()
+    result = await db.execute(
+        select(Follow.following_id).where(Follow.follower_id == user.id)
+    )
+    return set(result.scalars().all())
+
+
+def _annotate(post: Post, followed: set[int]) -> Post:
+    post.author_is_followed = post.author_id in followed
+    return post
+
+
 @router.get("", response_model=PostList)
 async def list_posts(
     topic_id: int,
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_current_user),
 ):
     offset = (page - 1) * per_page
     total_result = await db.execute(
@@ -38,6 +55,9 @@ async def list_posts(
         .limit(per_page)
     )
     posts = result.scalars().all()
+    followed = await _followed_ids(db, current_user)
+    for post in posts:
+        _annotate(post, followed)
     return PostList(items=posts, total=total, page=page, per_page=per_page)
 
 
@@ -48,7 +68,6 @@ async def create_post(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Verify topic exists
     result = await db.execute(select(Topic).where(Topic.id == topic_id))
     topic = result.scalar_one_or_none()
     if not topic:
@@ -62,14 +81,14 @@ async def create_post(
     )
     db.add(post)
 
-    # Increment topic post_count
     await db.execute(
         update(Topic).where(Topic.id == topic_id).values(post_count=Topic.post_count + 1)
     )
     await db.commit()
-    # Re-fetch with eagerly loaded relationships (refresh() doesn't load them)
     result = await db.execute(_post_query().where(Post.id == post.id))
-    return result.scalar_one()
+    post = result.scalar_one()
+    followed = await _followed_ids(db, current_user)
+    return _annotate(post, followed)
 
 
 @router.post("/{post_id}/vote", response_model=PostPublic)
@@ -85,7 +104,6 @@ async def vote_post(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    # Check existing vote
     existing = await db.execute(
         select(PostLike).where(PostLike.post_id == post_id, PostLike.user_id == current_user.id)
     )
@@ -95,14 +113,12 @@ async def vote_post(
 
     if existing_vote:
         if existing_vote.vote == new_vote:
-            # Remove vote (toggle off)
             if new_vote == VoteType.like:
                 post.like_count = max(0, post.like_count - 1)
             else:
                 post.dislike_count = max(0, post.dislike_count - 1)
             await db.delete(existing_vote)
         else:
-            # Switch vote
             if new_vote == VoteType.like:
                 post.like_count += 1
                 post.dislike_count = max(0, post.dislike_count - 1)
@@ -111,7 +127,6 @@ async def vote_post(
                 post.like_count = max(0, post.like_count - 1)
             existing_vote.vote = new_vote
     else:
-        # New vote
         vote_record = PostLike(post_id=post_id, user_id=current_user.id, vote=new_vote)
         db.add(vote_record)
         if new_vote == VoteType.like:
@@ -120,9 +135,10 @@ async def vote_post(
             post.dislike_count += 1
 
     await db.commit()
-    # Re-fetch with eagerly loaded relationships
     result = await db.execute(_post_query().where(Post.id == post.id))
-    return result.scalar_one()
+    post = result.scalar_one()
+    followed = await _followed_ids(db, current_user)
+    return _annotate(post, followed)
 
 
 @router.delete("/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
